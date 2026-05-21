@@ -1,0 +1,11 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# `media/`, `logs/`, `home/`, `db/` are gitignored already; ruff only walks
+# what the `scripts/` and `tests/` arguments to ``ruff check`` specify.
+# No extend-exclude needed.
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+# E,F,W = pycodestyle/pyflakes; I = isort; B = bugbear; UP = pyupgrade; SIM = simplify.
+ignore = ["E501"]  # line-length already handled above; rely on formatter for the rest.

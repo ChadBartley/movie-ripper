@@ -1,0 +1,47 @@
+services:
+  arm:
+    # Built locally from ./Dockerfile (extends upstream with rsync). Version
+    # pin lives in the Dockerfile's FROM line.
+    build:
+      context: .
+    image: movie-ripper-arm:2.20.7
+    container_name: arm
+    restart: unless-stopped
+    privileged: true
+    runtime: nvidia
+    ports:
+      - "8090:8080"
+    # Bind-mount host /dev so optical-drive hotplug propagates into the
+    # container. Docker's `devices:` directive only creates a static node
+    # at container start; when the host kernel re-registers /dev/sr0 on
+    # disc insert, the container's tmpfs /dev never sees it and ARM logs
+    # "We Cant find any system drives". Privileged + /dev:/dev is the
+    # standard ARM-on-Linux recipe.
+    environment:
+      # ARM_UID/ARM_GID intentionally NOT set — they trigger a chown bug in
+      # the entrypoint that breaks syslog-ng startup (upstream issue #1663,
+      # still live in 2.23.2). Image defaults to uid 1000; ensure host
+      # bind-mount dirs are 1000:1000.
+      TZ: ${TZ}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    volumes:
+      - /dev:/dev
+      - ./home:/home/arm
+      - ./media:/home/arm/media
+      - ./logs:/home/arm/logs
+      - ./db:/home/arm/db
+      - ./config:/etc/arm/config
+      - jellyfin:/mnt/jellyfin
+      # Workaround: syslog-ng init fails on Arch/Manjaro Docker hosts
+      # (phusion/baseimage-docker#540). ARM logs to /home/arm/logs/ via
+      # Python, so disabling syslog-ng is safe.
+      - ./scripts/noop-init.sh:/etc/my_init.d/10_syslog-ng.init:ro
+
+volumes:
+  jellyfin:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${SMB_USER},password=${SMB_PASSWORD},uid=${ARM_UID},gid=${ARM_GID},vers=3.0,iocharset=utf8,file_mode=0664,dir_mode=0775"
+      device: "//${SMB_HOST}/${SMB_SHARE}"

@@ -1,0 +1,17 @@
+.env
+*.log
+logs/
+media/
+db/
+home/
+config/arm.yaml
+
+# Python / test artifacts
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/
+uv.lock
+
+docs/
+.claude/

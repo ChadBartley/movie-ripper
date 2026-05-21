@@ -1,0 +1,4 @@
+# Notifications disabled — file kept so ARM has something to point at if enabled later.
+# To turn on: set APPRISE: "/etc/arm/config/apprise.yaml" in arm.yaml and add a service URL.
+# Examples: https://github.com/caronc/apprise/wiki
+urls: []
