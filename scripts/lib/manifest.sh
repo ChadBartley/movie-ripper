@@ -84,14 +84,17 @@ apply_manifest() {
   local src="$1" yaml="$src/mapping.yaml"
   echo "==> $src (manifest)"
   local show year tmdb_id default_season
-  show=$(yq -r '.show.name'    "$yaml")
-  year=$(yq -r '.show.year'    "$yaml")
-  tmdb_id=$(yq -r '.show.tmdb_id' "$yaml")
+  # Coerce YAML null to empty at the read boundary. mikefarah yq (v4) renders an
+  # explicit `~` null back as the literal string "~", not "null", so a bare read
+  # leaks "~" into folder names and episode numbers. `// ""` collapses both a
+  # `~`/null value and an absent key to empty, which the guards below then catch.
+  show=$(yq -r '.show.name    // ""' "$yaml")
+  year=$(yq -r '.show.year    // ""' "$yaml")
+  tmdb_id=$(yq -r '.show.tmdb_id // ""' "$yaml")
   default_season=$(yq -r '.season // ""' "$yaml")
-  [[ "$default_season" == "null" ]] && default_season=""
   for f in show year tmdb_id; do
-    if [[ "${!f}" == "null" || -z "${!f}" ]]; then
-      echo "  ABORT: mapping.yaml missing field: $f" >&2
+    if [[ -z "${!f}" ]]; then
+      echo "  ABORT: mapping.yaml missing field: $f (fill it in before approving)" >&2
       return 1
     fi
   done
@@ -99,20 +102,20 @@ apply_manifest() {
   local entries=() tracks track season ep title
   mapfile -t tracks < <(yq -r '.tracks | keys | .[]' "$yaml")
   for track in "${tracks[@]}"; do
-    ep=$(yq -r ".tracks[\"$track\"].episode" "$yaml")
-    title=$(yq -r ".tracks[\"$track\"].title // \"\"" "$yaml")
+    # `// ""` here too: an unfilled `episode: ~` must read back as empty so the
+    # track is skipped, not passed to zpad as the literal "~".
+    ep=$(yq -r ".tracks[\"$track\"].episode // \"\"" "$yaml")
+    title=$(yq -r ".tracks[\"$track\"].title   // \"\"" "$yaml")
     season=$(yq -r ".tracks[\"$track\"].season // \"\"" "$yaml")
-    [[ "$season" == "null" ]] && season=""
     [[ -z "$season" ]] && season="$default_season"
-    if [[ "$ep" == "null" || -z "$ep" ]]; then
-      echo "  SKIP track $track: episode is empty" >&2
+    if [[ -z "$ep" ]]; then
+      echo "  SKIP track $track: episode is empty (set 'episode: ~' to skip intentionally)" >&2
       continue
     fi
     if [[ -z "$season" ]]; then
       echo "  SKIP track $track: no season (set 'season:' on the track or at the top level)" >&2
       continue
     fi
-    [[ "$title" == "null" ]] && title=""
     entries+=("$track:$season:$ep:$title")
   done
 
@@ -121,6 +124,16 @@ apply_manifest() {
     return 1
   fi
 
-  rm -f "$yaml"
   apply_mapping "$src" "$show" "$year" "$tmdb_id" "$default_season" "${entries[@]}"
+
+  # Remove the manifest only once every track has been placed (no .mkv left in
+  # the source). A collision or skip leaves its track behind, so keeping the
+  # manifest makes the run repeatable instead of stranding files with no map —
+  # the previous "rm before apply" deleted the only mapping on a partial run.
+  if compgen -G "$src/*.mkv" > /dev/null; then
+    echo "  NOTE: tracks remain in $src; mapping.yaml kept so you can re-run after fixing" >&2
+    return 1
+  fi
+  rm -f "$yaml"
+  rmdir "$src" 2>/dev/null || true
 }

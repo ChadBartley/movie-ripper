@@ -41,7 +41,8 @@ whether something is allowed where you live, don't do it.
 ## What's in here
 
 ```
-docker-compose.yml         # the deploy unit
+docker-compose.yml         # the deploy unit (no server dependency)
+docker-compose.home.yml    # at-home overlay: SMB mount for promote.sh
 Dockerfile                 # thin layer over upstream ARM image (adds rsync)
 config/
   arm.yaml.example         # committed template for ARM main config
@@ -73,6 +74,15 @@ disc -> MakeMKV   -> ./media/raw/        (local SSD, deleted after transcode)
 ```
 
 ARM never writes to the server during the rip pipeline — it stays on the local SSD until you run `promote.sh`. Server down or laptop offline: keep ripping; promote later.
+
+### Ripping away from home
+
+The SMB mount lives in the `docker-compose.home.yml` overlay, selected via
+`COMPOSE_FILE` in `.env`. Docker performs the CIFS mount at container start,
+so with the overlay active an unreachable server blocks startup — away from
+home, comment out the `COMPOSE_FILE` line in `.env` and `docker compose up -d`
+runs the base file only. Rips accumulate on the local SSD; back home,
+uncomment the line, `docker compose up -d` again, and `promote.sh` as usual.
 
 ## Host dependencies (Manjaro)
 
@@ -120,13 +130,17 @@ $EDITOR config/arm.yaml       # paste OMDB_API_KEY into the OMDB_API_KEY: "" lin
 docker compose up -d
 ```
 
-Web UI at `http://<host>:8090` — default login `admin` / `password`.
+Web UI at `http://<host>:8060` — default login `admin` / `password`.
+
+The container doesn't start on boot (`restart: "no"`). To opt in, put a
+`restart: unless-stopped` override for the `arm` service in a compose file of
+your own and add it to `COMPOSE_FILE` in `.env`.
 
 ### Sanity checks before inserting a disc
 
 ```bash
 docker compose exec arm nvidia-smi              # GPU visible inside container?
-docker compose exec arm ls /mnt/jellyfin        # SMB mount working?
+docker compose exec arm ls /mnt/jellyfin        # SMB mount working? (home overlay only)
 docker compose exec arm grep OMDB_API_KEY /etc/arm/config/arm.yaml
                                                  # key set? (not just "")
 ```
@@ -166,10 +180,15 @@ ARM is unreliable at mapping MakeMKV tracks to specific TV episodes. The pipelin
 
    Walks a fallback ladder of subslikescript.com → Springfield! Springfield!
    → per-show Fandom wikis (e.g. `spongebob.fandom.com`, via the MediaWiki
-   API). Cached at `./media/.subs-cache/<tmdb_id>/`.
+   API). Cached at `./media/.subs-cache/<tmdb_id>/`. Fandom transcripts
+   are found under `<Title>/transcript`, `/Transcript` or `/Script`
+   subpages (falling back to a wiki search for titles spelled differently
+   from TMDB), and italic scene narration is stripped so only dialogue is
+   matched. Already-cached episodes are skipped; pass `--refresh` to
+   re-fetch them after a source adapter changes.
 
    To limit fetching to a subset of seasons (useful when you only own discs
-   for some of them — e.g. *Supernatural* S1–S2), pass `--seasons`:
+   for some of them — e.g. _Supernatural_ S1–S2), pass `--seasons`:
 
    ```bash
    ./scripts/fetch_transcripts.py --tmdb-id 1622 --seasons 1-2
@@ -189,9 +208,26 @@ ARM is unreliable at mapping MakeMKV tracks to specific TV episodes. The pipelin
    ./scripts/fetch_transcripts.py --tmdb-id 387 --sources fandom,subslikescript
    ```
 
+   **Debug a low coverage report with `--verbose`.** The source adapters log
+   why each source accepted or rejected a show (slug 404s, title-overlap
+   verification failures, missing wiki transcript pages); `--verbose` routes
+   those INFO-level diagnostics to stderr. Without it only WARNINGs surface,
+   and "0 episodes cached" is indistinguishable from "the sites have
+   nothing":
+
+   ```bash
+   ./scripts/fetch_transcripts.py --tmdb-id 2085 --verbose
+   ```
+
+   **SubsLikeScript is currently behind a JS captcha wall for plain-HTTP
+   clients** (HTTP 200 with a `captcha-protect` loading shell instead of
+   content), so that source resolves nothing even for shows it covers. It
+   stays in the default ladder as a cheap no-op; see `docs/backlog.md` for
+   the investigation notes.
+
    **Watch for transcript/track desync on SubsLikeScript.** SLS's slugs
    sometimes carry the wrong transcript under the right URL (observed on
-   *The Office* US S4 — the `episode-9-Dinner_Party` page actually serves
+   _The Office_ US S4 — the `episode-9-Dinner_Party` page actually serves
    Local Ad's text). Pass a Springfield index URL as the positional argument
    to seed-prime that source's resolver and skip discovery for that run:
 
@@ -202,7 +238,7 @@ ARM is unreliable at mapping MakeMKV tracks to specific TV episodes. The pipelin
    ```
 
    After fetching, spot-check a few cached files (`head -c 200
-   media/.subs-cache/<tmdb_id>/sNN/eNN-*.txt`) against the episode's actual
+media/.subs-cache/<tmdb_id>/sNN/eNN-*.txt`) against the episode's actual
    cold open before trusting the cache for identification.
 
 2. **Rip discs** as usual.
@@ -237,7 +273,7 @@ Then `./scripts/promote.sh series` as usual.
 Bonus features, deleted scenes, gag reels, webisodes, and other DVD/Blu-ray
 extras **are not identified**. The pipeline matches against TMDB's episode
 list — anything not in TMDB has no target to match to, and the public
-transcript sites don't carry extras either. In practice on *The Office*
+transcript sites don't carry extras either. In practice on _The Office_
 (US) this accounted for 1 unmatched track out of 186; it lands in
 `_review/` like any other miss. Either rename + promote it manually, or
 delete it.
@@ -258,15 +294,16 @@ mis-classified are picked up automatically.
 
 The `.env` file is **gitignored**. You'll fill it in fresh on each machine. Required fields:
 
-| Var                         | What                                                                         |
-| --------------------------- | ---------------------------------------------------------------------------- |
-| `ARM_UID` / `ARM_GID`       | `id -u` / `id -g` of the host user                                           |
-| `TZ`                        | e.g. `America/Los_Angeles`                                                   |
-| `ARM_DRIVES`                | Comma list of drives. Find with `lsscsi -g`.                                 |
-| `OMDB_API_KEY`              | Free key from omdbapi.com                                                    |
-| `TMDB_API_KEY`              | Free key from themoviedb.org (for `identify.sh`)                             |
-| `SMB_USER` / `SMB_PASSWORD` | Credentials for the SMB share defined by `SMB_HOST`/`SMB_SHARE`              |
-| `SCRAPER_CONTACT`           | Optional. URL/email appended to outbound User-Agent for transcript scraping. |
+| Var                         | What                                                                                                                          |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `ARM_UID` / `ARM_GID`       | `id -u` / `id -g` of the host user                                                                                            |
+| `TZ`                        | e.g. `America/Los_Angeles`                                                                                                    |
+| `ARM_DRIVES`                | Comma list of drives. Find with `lsscsi -g`.                                                                                  |
+| `OMDB_API_KEY`              | Free key from omdbapi.com                                                                                                     |
+| `TMDB_API_KEY`              | Free key from themoviedb.org (for `identify.sh`)                                                                              |
+| `SMB_USER` / `SMB_PASSWORD` | Credentials for the SMB share defined by `SMB_HOST`/`SMB_SHARE`                                                               |
+| `COMPOSE_FILE`              | Compose file list. Includes `docker-compose.home.yml` (the SMB mount) at home; comment out when ripping away from the server. |
+| `SCRAPER_CONTACT`           | Optional. URL/email appended to outbound User-Agent for transcript scraping.                                                  |
 
 ### Adding a second optical drive
 

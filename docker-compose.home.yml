@@ -1,0 +1,22 @@
+# At-home overlay: mounts the Jellyfin SMB share into the container at
+# /mnt/jellyfin for promote.sh. Kept out of the base docker-compose.yml
+# because Docker performs the CIFS mount at container start — if the SMB
+# host is unreachable (ripping away from home), the container refuses to
+# start entirely.
+#
+# Enable at home by setting in .env:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.home.yml
+# Away from home, comment that line out (or run
+# `docker compose -f docker-compose.yml up -d`, which overrides it).
+services:
+  arm:
+    volumes:
+      - jellyfin:/mnt/jellyfin
+
+volumes:
+  jellyfin:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${SMB_USER},password=${SMB_PASSWORD},uid=${ARM_UID},gid=${ARM_GID},vers=3.0,iocharset=utf8,file_mode=0664,dir_mode=0775"
+      device: "//${SMB_HOST}/${SMB_SHARE}"

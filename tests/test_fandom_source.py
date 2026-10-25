@@ -10,19 +10,24 @@ Covers:
   - _verify_via_titles: ≥3 hits accepts, <3 rejects, empty/short input
     rejects, ConnectionError-during-find_show is treated as a miss
   - find_show selects the first slug that verifies and skips others.
+  - italic-narration stripping (Bluey) without losing indented dialogue
+    (Courage), and the list=search fallback for titles the wiki spells
+    differently from TMDB.
 
 Tests stub the network at ``_get`` (returns response body strings) so no
 HTTP actually fires — same convention as test_sources.py.
 """
 
 import json
+import urllib.parse
 from pathlib import Path
 
 import pytest
 import requests
-from transcripts.cache import Episode
+from transcripts.cache import Episode, normalize_text
 from transcripts.sources import FandomSource, ShowRef
-from transcripts.sources.fandom import (
+from transcripts.sources._fandom_text import (
+    _pick_search_hit,
     _slug_candidates,
     _strip_rendered_html,
 )
@@ -95,6 +100,77 @@ def test_strip_rendered_html_drops_infobox_and_chrome():
 
 def test_strip_rendered_html_handles_empty():
     assert _strip_rendered_html("") == ""
+
+
+def test_strip_rendered_html_drops_italic_narration_blocks():
+    """Bluey wiki: scene description sits in fully-italic indented blocks."""
+    html = (
+        '<p><b>Bandit:</b> "Come on, start!"</p>'
+        "<dl><dd><i>The barbecue finally lights with a <a href='/x'>whoosh</a>.</i></dd></dl>"
+        '<p><b>Bluey:</b> "Whoosh!"</p>'
+    )
+    text = _strip_rendered_html(html)
+    assert "Come on, start!" in text
+    assert "Whoosh!" in text
+    assert "barbecue finally lights" not in text
+
+
+def test_strip_rendered_html_keeps_indented_dialogue():
+    """Courage wiki indents real dialogue with the same <dl><dd> markup."""
+    html = (
+        "<dl><dd><b>Muriel:</b> I can't wait for that wee lad Fred.</dd></dl>"
+        "<dl><dd><i>(sighs)</i> Courage, you're so silly.</dd></dl>"
+    )
+    text = _strip_rendered_html(html)
+    assert "I can't wait for that wee lad Fred." in text
+    assert "Courage, you're so silly." in text
+
+
+def test_strip_rendered_html_drops_italic_narration_paragraphs():
+    """Bluey 'Show and Tell': narration in a plain fully-italic paragraph."""
+    html = (
+        "<p><b>Bandit</b>: Yep. 16 Pelton Drive.</p>"
+        "<p><i>Bandit hangs up and pumps his arm.</i></p>"
+        "<p><b>Bandit</b>: Oos!</p>"
+    )
+    text = _strip_rendered_html(html)
+    assert "16 Pelton Drive." in text
+    assert "pumps his arm" not in text
+
+
+def test_strip_rendered_html_rejoins_colon_outside_bold_speaker():
+    """'<b>Bandit</b>: Hi' must come out as 'Bandit: Hi' so normalize_text
+    strips the speaker; split across lines, the name leaks into the text."""
+    html = "<p><b><a href='/wiki/Bandit_Heeler'>Bandit</a></b>: It's in good nick?</p>"
+    text = _strip_rendered_html(html)
+    assert "Bandit: It's in good nick?" in text
+    assert normalize_text(text) == "it's in good nick"
+
+
+# --- search-hit selection -----------------------------------------------
+
+
+def test_pick_search_hit_matches_respaced_title():
+    """Regression (Bluey): TMDB 'Wagonride' is 'Wagon Ride' on the wiki."""
+    hits = ["Wagon Ride", "Wagon Ride/Gallery", "Wagon Ride/Script", "Bus Stop Dog"]
+    assert _pick_search_hit("Wagonride", hits) == "Wagon Ride/Script"
+
+
+def test_pick_search_hit_matches_ampersand_spelled_out():
+    """Regression (Bluey): TMDB 'Show & Tell' is 'Show and Tell' on the wiki."""
+    hits = ["Show and Tell", "Show and Tell/Script", "Surfer (Show and Tell)"]
+    assert _pick_search_hit("Show & Tell", hits) == "Show and Tell/Script"
+
+
+def test_pick_search_hit_rejects_similar_sibling_episode():
+    """A higher-ranked transcript for a different episode must not win."""
+    hits = ["Christmas Cricket/Script", "Cricket/Script"]
+    assert _pick_search_hit("Cricket", hits) == "Cricket/Script"
+
+
+def test_pick_search_hit_returns_none_without_transcript_subpage():
+    hits = ["Wagon Ride", "Wagon Ride/Gallery"]
+    assert _pick_search_hit("Wagonride", hits) is None
 
 
 # --- fetch_episode ------------------------------------------------------
@@ -356,6 +432,168 @@ def test_find_show_too_few_episodes_returns_none(monkeypatch):
     )
     assert ref is None
     assert called["n"] == 0  # never even tried
+
+
+# --- transcript-subpage casing ------------------------------------------
+
+
+def _wiki_stub(existing_pages: set[str]):
+    """Simulate a MediaWiki api.php faithfully enough for casing tests.
+
+    Answers ``action=query`` by marking each requested title missing unless
+    it is in ``existing_pages`` (compared with spaces, exact case — the same
+    case-sensitivity real MediaWiki applies past a title's first character).
+    Answers ``action=parse`` with a canned body or ``missingtitle``.
+    """
+
+    def fake_get(url):
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        if params.get("list") == ["search"]:
+            # Crude stand-in for full-text search: a page matches when it
+            # contains the query, spacing ignored.
+            q = params["srsearch"][0].lower().replace(" ", "")
+            hits = [{"title": p} for p in sorted(existing_pages) if q in p.lower().replace(" ", "")]
+            return json.dumps({"query": {"search": hits}})
+        if params.get("action") == ["query"]:
+            pages = {}
+            for i, t in enumerate(params["titles"][0].split("|")):
+                norm = t.replace("_", " ")
+                if norm in existing_pages:
+                    pages[str(100 + i)] = {"pageid": 100 + i, "title": norm}
+                else:
+                    pages[str(-(i + 1))] = {"missing": "", "title": norm}
+            return json.dumps({"query": {"pages": pages}})
+        if params.get("action") == ["parse"]:
+            page = params["page"][0].replace("_", " ")
+            if page in existing_pages:
+                return json.dumps({"parse": {"text": {"*": f"<p>dialogue of {page}</p>"}}})
+            return json.dumps({"error": {"code": "missingtitle", "info": "no such page"}})
+        return ""
+
+    return fake_get
+
+
+def test_find_show_accepts_wiki_with_capital_t_transcript_pages(monkeypatch):
+    """Regression (Courage wiki): transcripts live at <Title>/Transcript.
+
+    MediaWiki subpage names are case-sensitive past the first character, so
+    querying only the lowercase /transcript variant reports every page
+    missing and rejects the correct wiki.
+    """
+    src = FandomSource()
+    eps = _spongebob_episodes()
+    monkeypatch.setattr(src, "_get", _wiki_stub({f"{ep.title}/Transcript" for ep in eps}))
+    ref = src.find_show(
+        "SpongeBob SquarePants",
+        year=1999,
+        tmdb_id=387,
+        expected_episodes=eps,
+    )
+    assert ref is not None
+    assert ref.url == "https://spongebob.fandom.com"
+
+
+def test_fetch_episode_falls_back_to_capital_t_transcript(monkeypatch):
+    """When /transcript is missing, /Transcript is tried before giving up."""
+    src = FandomSource()
+    monkeypatch.setattr(src, "_get", _wiki_stub({"Help Wanted/Transcript"}))
+    text = src.fetch_episode(
+        ShowRef(source="fandom", url="https://spongebob.fandom.com"),
+        season=1,
+        number=1,
+        title="Help Wanted",
+    )
+    assert text is not None
+    assert "dialogue of Help Wanted/Transcript" in text
+
+
+def test_fetch_episode_reuses_discovered_casing(monkeypatch):
+    """Once a wiki's casing is known, later episodes ask for it directly.
+
+    Without this, a capital-T wiki costs a wasted missingtitle roundtrip
+    per episode (102 extra seconds for a Courage-sized show at 1 req/sec).
+    """
+    src = FandomSource()
+    calls: list[str] = []
+    stub = _wiki_stub({"Help Wanted/Transcript", "Reef Blower/Transcript"})
+
+    def counting_get(url):
+        calls.append(url)
+        return stub(url)
+
+    monkeypatch.setattr(src, "_get", counting_get)
+    show = ShowRef(source="fandom", url="https://spongebob.fandom.com")
+    assert src.fetch_episode(show, season=1, number=1, title="Help Wanted") is not None
+    calls.clear()
+    assert src.fetch_episode(show, season=1, number=2, title="Reef Blower") is not None
+    assert len(calls) == 1
+    assert "page=Reef_Blower%2FTranscript" in calls[0]
+
+
+def test_fetch_episode_falls_back_to_episode_disambiguated_page(monkeypatch):
+    """Regression (Courage wiki): when an episode title collides with a
+    character page ('Freaky Fred' the barber), the wiki keeps the transcript
+    at '<Title> (episode)/Transcript'. The plain page misses; the
+    disambiguated variant must be tried before giving up."""
+    src = FandomSource()
+    monkeypatch.setattr(src, "_get", _wiki_stub({"Freaky Fred (episode)/Transcript"}))
+    text = src.fetch_episode(
+        ShowRef(source="fandom", url="https://courage.fandom.com"),
+        season=1,
+        number=8,
+        title="Freaky Fred",
+    )
+    assert text is not None
+    assert "dialogue of Freaky Fred (episode)/Transcript" in text
+
+
+def test_find_show_accepts_wiki_with_script_pages(monkeypatch):
+    """Regression (Bluey wiki): transcripts live at <Title>/Script.
+
+    Probing only /transcript and /Transcript reported every sample missing,
+    so the wiki was rejected and 120 of 153 episodes went uncached.
+    """
+    src = FandomSource()
+    eps = _spongebob_episodes()
+    monkeypatch.setattr(src, "_get", _wiki_stub({f"{ep.title}/Script" for ep in eps}))
+    ref = src.find_show(
+        "SpongeBob SquarePants",
+        year=1999,
+        tmdb_id=387,
+        expected_episodes=eps,
+    )
+    assert ref is not None
+    assert ref.url == "https://spongebob.fandom.com"
+
+
+def test_fetch_episode_falls_back_to_capital_e_episode_disambiguation(monkeypatch):
+    """Regression (Bluey wiki): 'Bingo' is the character, so the episode
+    transcript lives at 'Bingo (Episode)/Script' with a capital E."""
+    src = FandomSource()
+    monkeypatch.setattr(src, "_get", _wiki_stub({"Bingo (Episode)/Script"}))
+    text = src.fetch_episode(
+        ShowRef(source="fandom", url="https://bluey.fandom.com"),
+        season=2,
+        number=9,
+        title="Bingo",
+    )
+    assert text is not None
+    assert "dialogue of Bingo (Episode)/Script" in text
+
+
+def test_fetch_episode_falls_back_to_wiki_search(monkeypatch):
+    """Regression (Bluey wiki): TMDB 'Wagonride' has no page or redirect;
+    the transcript is at 'Wagon Ride/Script' and only search finds it."""
+    src = FandomSource()
+    monkeypatch.setattr(src, "_get", _wiki_stub({"Wagon Ride/Script"}))
+    text = src.fetch_episode(
+        ShowRef(source="fandom", url="https://bluey.fandom.com"),
+        season=1,
+        number=24,
+        title="Wagonride",
+    )
+    assert text is not None
+    assert "dialogue of Wagon Ride/Script" in text
 
 
 @pytest.mark.parametrize(

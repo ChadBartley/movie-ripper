@@ -39,7 +39,9 @@ if ! docker compose ps --status running --services 2>/dev/null | grep -q '^arm$'
 fi
 
 if ! docker compose exec -T arm mountpoint -q /mnt/jellyfin; then
-  echo "ERROR: /mnt/jellyfin not mounted in container. Server reachable?" >&2
+  echo "ERROR: /mnt/jellyfin not mounted in container. Is the home overlay" >&2
+  echo "enabled (COMPOSE_FILE in .env includes docker-compose.home.yml) and" >&2
+  echo "the server reachable? Restart with 'docker compose up -d' after fixing." >&2
   exit 1
 fi
 

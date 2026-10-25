@@ -81,5 +81,5 @@ Setup complete. Next steps:
      Add any extra drives to docker-compose.yml under 'devices:'
   2. Verify SMB credentials in .env
   3. Start ARM:                   docker compose up -d
-  4. Open the UI:                 http://localhost:8090  (admin / password)
+  4. Open the UI:                 http://localhost:8060  (admin / password)
 EOF

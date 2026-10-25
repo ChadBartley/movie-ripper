@@ -1,9 +1,12 @@
 """springfieldspringfield.co.uk adapter.
 
-Probes ``<slug>-us``, ``<slug>``, ``<slug>-uk`` in that order — most TMDB
-shows we care about are US-origin, and verification makes ordering
-non-load-bearing for correctness, just for HTTP economy. Uses the
-shared ``verify_show_match`` to reject same-name siblings.
+Probes ``<slug>-us``, ``<slug>``, ``<slug>-uk``, then ``<slug>-<year>``
+(when a year is known) in that order — most TMDB shows we care about are
+US-origin, and verification makes ordering non-load-bearing for
+correctness, just for HTTP economy. The year suffix is how Springfield
+disambiguates reboots and same-name shows (e.g.
+``courage-the-cowardly-dog-1999``). Uses the shared ``verify_show_match``
+to reject same-name siblings.
 """
 
 from __future__ import annotations
@@ -86,7 +89,12 @@ class SpringfieldSource:
         # -us first: most TMDB shows we care about are US-origin. Verification
         # makes order non-load-bearing for correctness, but ordering well saves
         # HTTP calls in the common case.
-        for candidate_slug in (base_slug + "-us", base_slug, base_slug + "-uk"):
+        candidate_slugs = [base_slug + "-us", base_slug, base_slug + "-uk"]
+        if year is not None:
+            # Springfield's disambiguator for reboots / same-name shows is a
+            # first-air-year suffix (courage-the-cowardly-dog-1999).
+            candidate_slugs.append(f"{base_slug}-{year}")
+        for candidate_slug in candidate_slugs:
             url = f"{self.BASE}/episode_scripts.php?tv-show={candidate_slug}"
             html = self._get(url)
             if not html:

@@ -31,6 +31,7 @@ Reads TMDB_API_KEY from .env.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import urllib.parse
@@ -57,6 +58,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = REPO_ROOT / "media" / ".subs-cache"
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+
+
+def _configure_logging(verbose: bool) -> None:
+    """Route the transcripts package's logs to stderr.
+
+    The source adapters explain every show-resolution rejection at INFO
+    ("springfield: rejected <slug> — title overlap below threshold") and every
+    scrape anomaly at WARNING; without a handler both are silently dropped and
+    an empty coverage report is indistinguishable from "the sites have
+    nothing". Idempotent — replaces any handler installed by a prior call.
+    """
+    pkg_logger = logging.getLogger("transcripts")
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    pkg_logger.handlers[:] = [handler]
+    pkg_logger.setLevel(logging.INFO if verbose else logging.WARNING)
 
 
 def _load_dotenv() -> None:
@@ -167,7 +184,14 @@ def main(
             f"Default: {','.join(DEFAULT_SOURCES)}."
         ),
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show source-resolution diagnostics (why each source accepted/rejected a show).",
+    ),
 ):
+    _configure_logging(verbose)
     _load_dotenv()
     tmdb_api_key = os.environ.get("TMDB_API_KEY")
     if not tmdb_api_key:

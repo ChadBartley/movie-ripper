@@ -189,6 +189,51 @@ def test_springfield_rejects_uk_office_when_expected_is_us(monkeypatch):
     assert "tv-show=the-office-us" in show_ref.url
 
 
+def test_springfield_probes_year_suffixed_slug(monkeypatch):
+    """Regression (Courage 1999): Springfield disambiguates some shows with a
+    first-air-year suffix (courage-the-cowardly-dog-1999). When the -us, bare,
+    and -uk slugs all miss and a year is known, find_show must probe
+    <slug>-<year> before giving up.
+    """
+    src = SpringfieldSource()
+    fake_pages = {
+        "https://www.springfieldspringfield.co.uk/episode_scripts.php?tv-show=the-office-2005": (
+            FIX / "springfield_index.html"
+        ).read_text(),
+    }
+    monkeypatch.setattr(src, "_get", lambda url: fake_pages.get(url, ""))
+    expected = [
+        Episode(season=1, number=1, title="Pilot"),
+        Episode(season=1, number=2, title="Diversity Day"),
+        Episode(season=5, number=15, title="Stress Relief"),
+    ]
+    show_ref = src.find_show("The Office", year=2005, tmdb_id=2316, expected_episodes=expected)
+    assert show_ref is not None
+    assert "tv-show=the-office-2005" in show_ref.url
+
+
+def test_springfield_skips_year_slug_when_year_unknown(monkeypatch):
+    """With no year hint there is no year slug to build — and definitely no
+    literal '<slug>-None' probe."""
+    src = SpringfieldSource()
+    seen: list[str] = []
+
+    def fake_get(url):
+        seen.append(url)
+        return ""
+
+    monkeypatch.setattr(src, "_get", fake_get)
+    expected = [
+        Episode(season=1, number=1, title="Pilot"),
+        Episode(season=1, number=2, title="Diversity Day"),
+        Episode(season=5, number=15, title="Stress Relief"),
+    ]
+    show_ref = src.find_show("The Office", year=None, tmdb_id=2316, expected_episodes=expected)
+    assert show_ref is None
+    assert len(seen) == 3
+    assert all("None" not in url for url in seen)
+
+
 def test_springfield_returns_none_when_no_slug_verifies(monkeypatch):
     src = SpringfieldSource()
     uk_html = (FIX / "springfield_uk_index.html").read_text()

@@ -12,12 +12,21 @@ Show resolution:
        "spongebob-squarepants"]).
     2. For each candidate, batch-query ``action=query&titles=...``
        asking whether the first ~5 expected episode titles exist as
-       ``<Title>/transcript`` pages on that wiki.
-    3. Accept the first wiki where ≥3 of those pages are present.
+       ``<Title>/transcript``, ``<Title>/Transcript`` or ``<Title>/Script``
+       pages on that wiki. The subpage name varies per wiki (SpongeBob:
+       lowercase, Courage: capital-T, Bluey: Script) and MediaWiki subpage
+       names are case-sensitive past the title's first character, so every
+       variant must be probed.
+    3. Accept the first wiki where ≥3 of those pages are present, and
+       remember which subpage name the wiki uses so episode fetches don't
+       pay a missingtitle roundtrip each.
 
 Episode fetch:
     ``action=parse&page=<Title>/transcript&prop=text`` returns rendered
-    HTML; we strip the infobox and editor chrome and emit text.
+    HTML; we strip the infobox, editor chrome and italic narration blocks
+    and emit text (see ``_fandom_text``). When every guessed page name
+    misses, one ``list=search`` query catches titles the wiki spells
+    differently from TMDB ("Wagonride" vs. "Wagon Ride").
 
 Politeness:
     - 1 req/sec via the shared ``_polite_get`` helper.
@@ -32,87 +41,29 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 import urllib.parse
+from collections.abc import Iterator
 
 import requests
-from bs4 import BeautifulSoup
 
 from transcripts.cache import Episode
 from transcripts.sources._base import SHOW_MATCH_MIN_OVERLAP, ShowRef, _polite_get
+from transcripts.sources._fandom_text import (
+    _EPISODE_DISAMBIGUATORS,
+    _TRANSCRIPT_SUFFIXES,
+    _pick_search_hit,
+    _slug_candidates,
+    _strip_rendered_html,
+    _title_to_page,
+)
 
 logger = logging.getLogger(__name__)
 
 VERIFY_SAMPLE_SIZE = 5
 MAXLAG_SECONDS = 5
 MAXLAG_RETRY_SLEEP_CAP = 10.0
-
-# Selectors for chrome we strip from the rendered transcript HTML. The
-# infobox and edit-section spans aren't dialogue; navboxes and references
-# are footers; mw-empty-elt is wiki-template scaffolding.
-_STRIP_SELECTORS = (
-    "aside.portable-infobox",
-    "span.mw-editsection",
-    ".navbox",
-    ".reference",
-    ".navigation-not-searchable",
-    ".mw-empty-elt",
-    "table.toc",
-)
-
-
-def _slug_candidates(name: str) -> list[str]:
-    """Return ranked Fandom subdomain slug guesses for a show name.
-
-    Order: first significant word, all-words concatenated (sans "the"),
-    all-words concatenated (with "the" if originally present), and the
-    dashed form. Duplicates are removed while preserving order so the
-    cheapest correct guess wins.
-    """
-    s = name.lower()
-    # Elide apostrophes outright ("Bob's Burgers" → "bobs burgers", which
-    # matches Fandom's bobs-burgers.fandom.com convention). Other
-    # punctuation collapses to a separator instead.
-    s = s.replace("’", "").replace("'", "")
-    no_punct = re.sub(r"[^a-z0-9 ]+", " ", s)
-    no_punct = re.sub(r"\s+", " ", no_punct).strip()
-    if not no_punct:
-        return []
-    no_the = re.sub(r"^the\s+", "", no_punct)
-    words = no_the.split()
-
-    candidates: list[str] = []
-
-    def _add(c: str) -> None:
-        if c and c not in candidates:
-            candidates.append(c)
-
-    if words:
-        _add(words[0])
-    _add(no_the.replace(" ", ""))
-    _add(no_punct.replace(" ", ""))
-    _add(re.sub(r"\s+", "-", no_the).strip("-"))
-    return candidates
-
-
-def _title_to_page(title: str) -> str:
-    """Convert a TMDB episode title to its MediaWiki page name (no encoding).
-
-    MediaWiki normalizes spaces to underscores; we do the same up-front so
-    the API's ``redirects=1`` doesn't have to do extra work and so logs
-    show what we asked for verbatim.
-    """
-    return title.replace(" ", "_")
-
-
-def _strip_rendered_html(html: str) -> str:
-    """Strip wiki chrome (infobox, edit links, navboxes) and return text."""
-    soup = BeautifulSoup(html, "html.parser")
-    for selector in _STRIP_SELECTORS:
-        for el in soup.select(selector):
-            el.decompose()
-    return soup.get_text(separator="\n").strip()
+SEARCH_RESULT_LIMIT = 10
 
 
 class FandomSource:
@@ -120,6 +71,9 @@ class FandomSource:
 
     def __init__(self):
         self._session = requests.Session()
+        # host → transcript-subpage casing discovered for that wiki. Primed by
+        # _verify_via_titles and updated whenever a fetch succeeds.
+        self._suffix_by_host: dict[str, str] = {}
 
     def _get(self, url: str) -> str:
         return _polite_get(url, self._session)
@@ -164,11 +118,20 @@ class FandomSource:
         return None
 
     def _verify_via_titles(self, host: str, expected_episodes: list[Episode]) -> bool:
-        """Return True iff ≥SHOW_MATCH_MIN_OVERLAP sample transcripts exist on host."""
+        """Return True iff ≥SHOW_MATCH_MIN_OVERLAP sample transcripts exist on host.
+
+        Probes every subpage name in _TRANSCRIPT_SUFFIXES in one batch query; an
+        episode counts as found if any name exists. On success, records the
+        wiki's dominant subpage name in _suffix_by_host for fetch_episode.
+        """
         sample = expected_episodes[:VERIFY_SAMPLE_SIZE]
         if len(sample) < SHOW_MATCH_MIN_OVERLAP:
             return False
-        titles = "|".join(f"{_title_to_page(ep.title)}/transcript" for ep in sample)
+        titles = "|".join(
+            f"{_title_to_page(ep.title)}/{suffix}"
+            for ep in sample
+            for suffix in _TRANSCRIPT_SUFFIXES
+        )
         data = self._api_call(
             host,
             {
@@ -184,8 +147,20 @@ class FandomSource:
         pages = data["query"].get("pages", {})
         # MediaWiki marks non-existent pages with a "missing" key; a page
         # with a real pageid lacks it.
-        found = sum(1 for p in pages.values() if "missing" not in p)
-        return found >= SHOW_MATCH_MIN_OVERLAP
+        found_by_suffix: dict[str, set[str]] = {s: set() for s in _TRANSCRIPT_SUFFIXES}
+        for p in pages.values():
+            if "missing" in p:
+                continue
+            base, _, suffix = p.get("title", "").rpartition("/")
+            if base and suffix in found_by_suffix:
+                found_by_suffix[suffix].add(base)
+        found = set().union(*found_by_suffix.values())
+        if len(found) < SHOW_MATCH_MIN_OVERLAP:
+            return False
+        self._suffix_by_host[host] = max(
+            _TRANSCRIPT_SUFFIXES, key=lambda s: len(found_by_suffix[s])
+        )
+        return True
 
     def find_show(
         self,
@@ -216,28 +191,81 @@ class FandomSource:
             )
         return None
 
-    def fetch_episode(self, show: ShowRef, season: int, number: int, title: str) -> str | None:
-        """Fetch a transcript by title. season/number unused — Fandom keys on title."""
-        page = f"{_title_to_page(title)}/transcript"
+    def _search_transcript_page(self, host: str, title: str) -> str | None:
+        """Full-text search the wiki for ``title``'s transcript subpage.
+
+        Last resort for titles TMDB spells differently from the wiki, where
+        no redirect bridges the two. Returns the page title to parse, or None
+        when search fails or no hit passes ``_pick_search_hit``.
+        """
         data = self._api_call(
-            show.url,
+            host,
             {
-                "action": "parse",
-                "page": page,
+                "action": "query",
+                "list": "search",
+                "srsearch": title,
+                "srlimit": str(SEARCH_RESULT_LIMIT),
                 "format": "json",
-                "prop": "text",
-                "redirects": "1",
                 "maxlag": str(MAXLAG_SECONDS),
             },
         )
         if data is None:
             return None
-        err = data.get("error")
-        if err:
-            code = err.get("code")
-            if code == "missingtitle":
-                logger.info("fandom: no transcript page %s on %s", page, show.url)
-            else:
+        if "query" not in data:
+            logger.warning("fandom: search for %r on %s failed: %s", title, host, data.get("error"))
+            return None
+        hits = [h.get("title", "") for h in data["query"].get("search", [])]
+        page = _pick_search_hit(title, hits)
+        logger.info("fandom: search for %r on %s → %s (hits: %s)", title, host, page, hits)
+        return page
+
+    def _candidate_pages(self, host: str, title: str) -> Iterator[str]:
+        """Yield transcript page names to try, cheapest-likely first.
+
+        The search fallback is lazy: it only fires once every guessed name
+        has missed.
+        """
+        preferred = self._suffix_by_host.get(host, _TRANSCRIPT_SUFFIXES[0])
+        suffixes = (preferred, *(s for s in _TRANSCRIPT_SUFFIXES if s != preferred))
+        page_bases = tuple(_title_to_page(title + d) for d in ("", *_EPISODE_DISAMBIGUATORS))
+        for suffix in suffixes:
+            for base in page_bases:
+                yield f"{base}/{suffix}"
+        hit = self._search_transcript_page(host, title)
+        if hit:
+            yield hit
+
+    def fetch_episode(self, show: ShowRef, season: int, number: int, title: str) -> str | None:
+        """Fetch a transcript by title. season/number unused — Fandom keys on title.
+
+        Tries the wiki's known transcript-subpage name first (discovered at
+        verify time), falling back to the others on missingtitle so a wiki
+        with mixed conventions still resolves. Within each subpage name, also
+        tries the '<Title> (episode)' / '<Title> (Episode)' disambiguations
+        wikis use when an episode title collides with another page (e.g. a
+        character of the same name). If all of those miss, one wiki search
+        runs. A full miss costs 10 requests (~10s at the polite rate).
+        """
+        for page in self._candidate_pages(show.url, title):
+            data = self._api_call(
+                show.url,
+                {
+                    "action": "parse",
+                    "page": page,
+                    "format": "json",
+                    "prop": "text",
+                    "redirects": "1",
+                    "maxlag": str(MAXLAG_SECONDS),
+                },
+            )
+            if data is None:
+                return None
+            err = data.get("error")
+            if err:
+                code = err.get("code")
+                if code == "missingtitle":
+                    logger.info("fandom: no transcript page %s on %s", page, show.url)
+                    continue
                 logger.warning(
                     "fandom: API error %s for %s on %s: %s",
                     code,
@@ -245,8 +273,10 @@ class FandomSource:
                     show.url,
                     err.get("info"),
                 )
-            return None
-        html = data.get("parse", {}).get("text", {}).get("*", "")
-        if not html:
-            return None
-        return _strip_rendered_html(html) or None
+                return None
+            html = data.get("parse", {}).get("text", {}).get("*", "")
+            if not html:
+                return None
+            self._suffix_by_host[show.url] = page.rpartition("/")[2]
+            return _strip_rendered_html(html) or None
+        return None

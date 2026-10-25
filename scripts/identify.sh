@@ -76,11 +76,16 @@ tmdb_get() {
 }
 
 tmdb_search_show() {
-  local name="$1"
+  local name="$1" year="${2:-}"
   local query
   query=$(jq -rn --arg s "$name" '$s|@uri')
   local key="search-$(echo -n "$name" | tr '[:upper:] /' '[:lower:]__' | tr -cd 'a-z0-9_-')"
-  tmdb_get "$key" "$TMDB_API/search/tv?api_key=$TMDB_API_KEY&query=$query"
+  local url="$TMDB_API/search/tv?api_key=$TMDB_API_KEY&query=$query"
+  if [[ -n "$year" ]]; then
+    key="${key}-${year}"
+    url="${url}&first_air_date_year=${year}"
+  fi
+  tmdb_get "$key" "$url"
 }
 
 tmdb_get_season() {
@@ -104,9 +109,13 @@ parse_label() {
   # TMDB search isn't poisoned. Years (4 digits) and S/D numbers (1-2) survive.
   norm=$(printf '%s' "$norm" | sed -E 's/_[0-9]{6,}$//')
 
-  # Strip a trailing parenthesized year / year-range hint like (2005) or
-  # (2005–2013) (em-dash or hyphen). TMDB search wants just the show name;
-  # the year is recovered from the search hit's first_air_date.
+  # Peel off a trailing parenthesized year / year-range hint like (2005) or
+  # (2005–2013) (em-dash or hyphen). The year constrains the TMDB search so
+  # same-name shows (e.g. the 2024 remake of a 2005 series) don't win on rank.
+  local year=""
+  if [[ "$norm" =~ \(([0-9]{4})[^\)]*\)$ ]]; then
+    year="${BASH_REMATCH[1]}"
+  fi
   norm=$(printf '%s' "$norm" | sed -E 's/_?\([0-9]{4}[^)]*\)$//')
 
   local show season disc
@@ -114,6 +123,11 @@ parse_label() {
   if [[ "$norm" =~ ^(.+)_S([0-9]{1,2})_D([0-9]{1,2})$ ]]; then
     show="${BASH_REMATCH[1]}" season="${BASH_REMATCH[2]}" disc="${BASH_REMATCH[3]}"
   elif [[ "$norm" =~ ^(.+)_SEASON_([0-9]{1,2})_DISC_([0-9]{1,2})$ ]]; then
+    show="${BASH_REMATCH[1]}" season="${BASH_REMATCH[2]}" disc="${BASH_REMATCH[3]}"
+  elif [[ "$norm" =~ ^(.+)_S([0-9]{1,2})D([0-9]{1,2})$ ]]; then
+    # Glued disc label with no separator between S and D, e.g.
+    # ADVENTURE_TIME_S01D01. Without this the whole "S01D01" stays glued to the
+    # show name and poisons the TMDB search.
     show="${BASH_REMATCH[1]}" season="${BASH_REMATCH[2]}" disc="${BASH_REMATCH[3]}"
   elif [[ "$norm" =~ ^(.+)_S([0-9]{1,2})$ ]]; then
     show="${BASH_REMATCH[1]}" season="${BASH_REMATCH[2]}" disc=""
@@ -130,7 +144,7 @@ parse_label() {
   season="${season#0}"
   disc="${disc#0}"
 
-  printf '%s|%s|%s\n' "$show" "$season" "$disc"
+  printf '%s|%s|%s|%s\n' "$show" "$season" "$disc" "$year"
 }
 
 # --- Cascade per folder --------------------------------------------------
@@ -295,24 +309,24 @@ process_folder() {
 
   # Collect mkv tracks (sorted by name; preserves MakeMKV scan order)
   local tracks=()
-  mapfile -t tracks < <(find "$src" -maxdepth 1 -type f -name '*.mkv' -printf '%f\n' | sort)
+  mapfile -t tracks < <(find "$src" -maxdepth 1 -type f -name '*.mkv' -printf '%f\n' | sort -V)
   if (( ${#tracks[@]} == 0 )); then
     echo "  no mkvs, skipping"
     return
   fi
 
   # Tier 1 — label parse
-  local parsed show_guess season disc
+  local parsed show_guess season disc label_year
   parsed=$(parse_label "$base")
-  IFS='|' read -r show_guess season disc <<<"$parsed"
-  echo "  label: show='$show_guess' season='${season:-?}' disc='${disc:-?}'"
+  IFS='|' read -r show_guess season disc label_year <<<"$parsed"
+  echo "  label: show='$show_guess' season='${season:-?}' disc='${disc:-?}' year='${label_year:-?}'"
 
   local reasons=""
   local score=0
 
   # Tier 2 — TMDB show search
   local search_json show_name year tmdb_id show_count
-  if ! search_json=$(tmdb_search_show "$show_guess"); then
+  if ! search_json=$(tmdb_search_show "$show_guess" "$label_year"); then
     reasons+=$'\nTMDB show search failed (network or auth)'
     quarantine "$src" "$show_guess" "" "" "$season" "$disc" "$reasons" "${tracks[@]}"
     return

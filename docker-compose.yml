@@ -4,13 +4,17 @@ services:
     # pin lives in the Dockerfile's FROM line.
     build:
       context: .
-    image: movie-ripper-arm:2.20.7
+    image: movie-ripper-arm:2.24.3
     container_name: arm
-    restart: unless-stopped
+    # No auto-start on boot: the container runs only when you start it. To
+    # opt in, override `restart: unless-stopped` in a compose file of your
+    # own listed in COMPOSE_FILE (see README).
+    restart: "no"
     privileged: true
     runtime: nvidia
     ports:
-      - "8090:8080"
+      # Host port 8060: 8090 collides with too many other services' defaults.
+      - "8060:8080"
     # Bind-mount host /dev so optical-drive hotplug propagates into the
     # container. Docker's `devices:` directive only creates a static node
     # at container start; when the host kernel re-registers /dev/sr0 on
@@ -32,16 +36,11 @@ services:
       - ./logs:/home/arm/logs
       - ./db:/home/arm/db
       - ./config:/etc/arm/config
-      - jellyfin:/mnt/jellyfin
+      # The /mnt/jellyfin SMB mount lives in docker-compose.home.yml — it's
+      # an at-home overlay so the container can start with the file server
+      # unreachable (rip on the road, promote later). Enable it via
+      # COMPOSE_FILE in .env; see .env.example.
       # Workaround: syslog-ng init fails on Arch/Manjaro Docker hosts
       # (phusion/baseimage-docker#540). ARM logs to /home/arm/logs/ via
       # Python, so disabling syslog-ng is safe.
       - ./scripts/noop-init.sh:/etc/my_init.d/10_syslog-ng.init:ro
-
-volumes:
-  jellyfin:
-    driver: local
-    driver_opts:
-      type: cifs
-      o: "username=${SMB_USER},password=${SMB_PASSWORD},uid=${ARM_UID},gid=${ARM_GID},vers=3.0,iocharset=utf8,file_mode=0664,dir_mode=0775"
-      device: "//${SMB_HOST}/${SMB_SHARE}"

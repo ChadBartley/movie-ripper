@@ -1,4 +1,6 @@
-"""Tests for fetch_transcripts.py's --sources flag parser."""
+"""Tests for fetch_transcripts.py's --sources flag parser and logging setup."""
+
+import logging
 
 # conftest.py adds scripts/ to sys.path; fetch_transcripts is a top-level
 # script there.
@@ -60,3 +62,21 @@ def test_empty_tokens_only_raises_bad_parameter():
     """`,,,` parses to no names; that's a bug in the user's command line."""
     with pytest.raises(typer.BadParameter):
         fetch_transcripts.parse_sources_arg(",,,")
+
+
+# --- logging configuration ----------------------------------------------
+
+
+def test_configure_logging_verbose_enables_source_diagnostics():
+    """--verbose must surface the adapters' INFO-level rejection reasons
+    (e.g. 'springfield: rejected <slug>') that are otherwise dropped."""
+    fetch_transcripts._configure_logging(verbose=True)
+    assert logging.getLogger("transcripts.sources.springfield").isEnabledFor(logging.INFO)
+
+
+def test_configure_logging_default_keeps_warnings_visible():
+    """Default run hides INFO chatter but must never bury WARNINGs."""
+    fetch_transcripts._configure_logging(verbose=False)
+    src_logger = logging.getLogger("transcripts.sources.fandom")
+    assert not src_logger.isEnabledFor(logging.INFO)
+    assert src_logger.isEnabledFor(logging.WARNING)
